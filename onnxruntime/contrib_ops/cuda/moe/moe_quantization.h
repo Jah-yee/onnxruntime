@@ -131,6 +131,7 @@ class QMoE final : public CudaKernel, public MoEBase {
   // Routes INT3 and INT3-mixed prefill through the FP32 SIMT kernels, which evaluate SwiGLU from the FP32
   // accumulators. The default Tensor Core prefill stores the FC1 result as FP16/BF16 before the activation.
   bool disable_int3_tc_prefill_ = false;
+  int moe_tc_min_rows_ = 33;
 
   std::unique_ptr<onnxruntime::llm::kernels::cutlass_kernels::CutlassMoeFCRunnerInterface> m_moe_runner;
 

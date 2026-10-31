@@ -376,6 +376,27 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   ORT_ENFORCE(int_dequant_max_scratch_bytes_ > 0,
               int_dequant_max_scratch_bytes_source, " must be greater than 0, got ",
               int_dequant_max_scratch_bytes_, ".");
+  auto parse_bounded_option = [&](const char* config_key, const char* env_key, int default_val,
+                                  int min_val, int max_val) -> int {
+    if (auto cfg = op_kernel_info.GetConfigOptions().GetConfigEntry(config_key); cfg.has_value()) {
+      int64_t v = 0;
+      ORT_ENFORCE(TryParseSignedInt64(*cfg, v) && v >= min_val && v <= max_val,
+                  config_key, " must be an integer in [", min_val, ", ", max_val, "], got '", *cfg, "'.");
+      return static_cast<int>(v);
+    }
+    if (auto env = onnxruntime::ParseEnvironmentVariable<std::string>(env_key); env.has_value()) {
+      int64_t v = 0;
+      ORT_ENFORCE(TryParseSignedInt64(*env, v) && v >= min_val && v <= max_val,
+                  env_key, " must be an integer in [", min_val, ", ", max_val, "], got '", *env, "'.");
+      return static_cast<int>(v);
+    }
+    return default_val;
+  };
+  moe_tc_min_rows_ = parse_bounded_option("ep.cuda.moe_gemv_tc_min_rows", "ORT_MOE_GEMV_TC_MIN_ROWS",
+                                          33, 1, std::numeric_limits<int>::max());
+  if (parse_bounded_option("ep.cuda.disable_moe_gemv_tc", "ORT_DISABLE_MOE_GEMV_TC", 0, 0, 1) != 0) {
+    moe_tc_min_rows_ = 0;
+  }
   const auto configured_disable_int3_tc_prefill =
       op_kernel_info.GetConfigOptions().GetConfigEntry(kQMoEDisableInt3TensorCorePrefillConfig);
   if (configured_disable_int3_tc_prefill.has_value()) {
@@ -2305,14 +2326,15 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
             static_cast<const WeightType*>(packed_int_fc1),
             static_cast<const T*>(p_fc1_scales), fc1_bias, fc1_output,
             p_efto, p_exp, num_experts, expanded, inter, hidden, static_cast<int>(block_size_), sm_,
-            act_params, p_r2u, num_rows, nullptr, stream);
+            act_params, p_r2u, num_rows, nullptr, stream, moe_tc_min_rows_);
       };
       auto launch_fc2 = [&](auto* weight_type) {
         using WeightType = std::remove_pointer_t<decltype(weight_type)>;
         gemv::launch_moe_gemv_int_symmetric<T, WeightType>(
             fc1_output, static_cast<const WeightType*>(packed_int_fc2),
             static_cast<const T*>(p_fc2_scales), fc2_bias, fc2_output,
-            p_efto, p_exp, num_experts, expanded, hidden, inter, static_cast<int>(block_size_), sm_, stream);
+            p_efto, p_exp, num_experts, expanded, hidden, inter, static_cast<int>(block_size_), sm_, stream,
+            moe_tc_min_rows_);
       };
       if (fc1_expert_weight_bits_ == 2) {
         launch_fc1(static_cast<cutlass::uint2b_t*>(nullptr));
@@ -3412,6 +3434,32 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
                static_cast<int>(weight_bits), static_cast<int>(block_size_));
   };
 
+  const auto int_scale_supports_packed_execution = [&](int64_t weight_bits) {
+    if ((!enable_int2_gemv_ && !enable_int2_prefill_) ||
+        activation_type_ != onnxruntime::llm::kernels::cutlass_kernels::ActivationType::Swiglu ||
+        swiglu_fusion_ != 1 || (block_size_ != 32 && block_size_ != 64 && block_size_ != 128)) {
+      return false;
+    }
+
+    const auto& shape = tensor.Shape();
+    if (shape.NumDimensions() != 3 || block_size_ <= 0 ||
+        shape[2] > std::numeric_limits<int64_t>::max() / block_size_) {
+      return false;
+    }
+
+    const int64_t reduction_size = shape[2] * block_size_;
+    if (enable_int2_prefill_ && shape[0] > 0 && shape[0] <= 512 &&
+        shape[1] > 0 && shape[1] <= std::numeric_limits<int>::max() && shape[1] % 64 == 0 &&
+        reduction_size > 0 && reduction_size <= std::numeric_limits<int>::max() && reduction_size % 64 == 0) {
+      return true;
+    }
+
+    return enable_int2_gemv_ && (block_size_ == 32 || block_size_ == 64 || block_size_ == 128) &&
+           onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
+               sm_, /*expanded_num_rows=*/1, shape[1], reduction_size,
+               static_cast<int>(weight_bits), static_cast<int>(block_size_));
+  };
+
   cudaStream_t stream = 0;  // Use default stream for PrePack operations
 
   DUMP_TENSOR_INIT();
@@ -3621,7 +3669,8 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       }
     } else if (quant_type_ == "int") {
       if (uses_packed_int_decode) {
-        if (packed_fc1_weights_ || weights_prepacked_) {
+        if (packed_fc1_weights_ || weights_prepacked_ ||
+            int_scale_supports_packed_execution(fc1_expert_weight_bits_)) {
           if (weights_prepacked_) {
             // The initializer is released below, so cache its shape for validation at Run time.
             fc1_scales_shape_ = tensor.Shape();
@@ -3678,7 +3727,8 @@ Status QMoE::PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
       }
     } else if (quant_type_ == "int") {
       if (uses_packed_int_decode) {
-        if (packed_fc2_weights_ || weights_prepacked_) {
+        if (packed_fc2_weights_ || weights_prepacked_ ||
+            int_scale_supports_packed_execution(fc2_expert_weight_bits_)) {
           if (weights_prepacked_) {
             // The initializer is released below, so cache its shape for validation at Run time.
             fc2_scales_shape_ = tensor.Shape();
