@@ -984,9 +984,13 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
           (quant_type_ == "int" && expert_weight_bits_ == 3 &&
            fc1_expert_weight_bits_ == 3 && fc2_expert_weight_bits_ == 3 &&
            !weights_prepacked_ && (block_size_ == 32 || block_size_ == 64 || block_size_ == 128));
+      const bool int2_sm80_prepacked =
+          (quant_type_ == "int" && expert_weight_bits_ == 2 &&
+           fc1_expert_weight_bits_ == 2 && fc2_expert_weight_bits_ == 2 &&
+           weights_prepacked_ && (block_size_ == 32 || block_size_ == 64 || block_size_ == 128));
       const bool node_eligible =
-          (nvfp4_weights_row_major_ || int4_sm80_prepacked || int3_raw) &&
-          (expert_weight_bits_ == 4 || int3_raw) &&
+          (nvfp4_weights_row_major_ || int4_sm80_prepacked || int3_raw || int2_sm80_prepacked) &&
+          (expert_weight_bits_ == 4 || int3_raw || int2_sm80_prepacked) &&
           is_interleaved_swiglu &&
           !use_sparse_mixer_ &&
           !has_unsupported_slot &&
@@ -997,22 +1001,27 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
         ORT_ENFORCE(offload_policy_.mode != onnxruntime::moe_offload::OffloadMode::kRequired,
                     "QMoE offload mode='required' rejected node '", op_kernel_info.node().Name(),
                     "': quant_type='", quant_type_, "', nvfp4_row_major_weights=", nvfp4_weights_row_major_,
-                    " (expected 'nvfp4' with weights_prepacked=1, prepacked 'int' INT4, or raw 'int' INT3)",
+                    " (expected 'nvfp4' with weights_prepacked=1, prepacked 'int' INT4/INT2, or raw 'int' INT3)",
                     ", int4_sm80_prepacked=", int4_sm80_prepacked, ", int3_raw=", int3_raw,
+                    ", int2_sm80_prepacked=", int2_sm80_prepacked,
                     ", swiglu_fusion=", swiglu_fusion_, ", use_sparse_mixer=", use_sparse_mixer_,
                     ", unsupported_slot=", bad_slot_idx, ", has_const_cpu_weights=", has_const_weights);
       } else {
         const int32_t num_e = static_cast<int32_t>(fc1_w->Shape()[0]);
         const bool legacy_4b_w = (fc1_w->Shape()[1] == fc2_w->Shape()[2] * 2 &&
                                   fc1_w->Shape()[2] == fc2_w->Shape()[1]);
-        const int32_t hid = (int3_raw || !legacy_4b_w)
+        const bool legacy_2b_w = int2_sm80_prepacked &&
+                                 (fc1_w->Shape()[1] == fc2_w->Shape()[2] * 4 &&
+                                  fc1_w->Shape()[2] * 2 == fc2_w->Shape()[1]);
+        const int32_t hid = (int3_raw || (!legacy_4b_w && !legacy_2b_w))
                                 ? static_cast<int32_t>(fc2_w->Shape()[1])
                                 : static_cast<int32_t>(fc1_w->Shape()[1]);
-        const int32_t inter = (int3_raw || !legacy_4b_w)
+        const int32_t inter = (int3_raw || (!legacy_4b_w && !legacy_2b_w))
                                   ? static_cast<int32_t>(fc1_w->Shape()[1] / 2)
                                   : static_cast<int32_t>(fc2_w->Shape()[1]);
-        const size_t blk = int3_raw ? static_cast<size_t>(block_size_)
-                                    : ((quant_type_ == "nvfp4") ? 16u : 32u);
+        const size_t blk = (int3_raw || int2_sm80_prepacked)
+                               ? static_cast<size_t>(block_size_)
+                               : ((quant_type_ == "nvfp4") ? 16u : 32u);
 
         offload_source_desc_.op_type = "QMoE";
         offload_source_desc_.quant_type = quant_type_;
@@ -1071,6 +1080,9 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
         onnxruntime::contrib::qmoe_shared::Nvfp4ExpertBlockLayout host_layout{};
         const bool layout_ok = int3_raw
                                    ? onnxruntime::contrib::qmoe_shared::MakeInt3ExpertBlockLayout(
+                                         hid, inter, static_cast<int64_t>(blk), &host_layout)
+                               : int2_sm80_prepacked
+                                   ? onnxruntime::contrib::qmoe_shared::MakeInt2ExpertBlockLayout(
                                          hid, inter, static_cast<int64_t>(blk), &host_layout)
                                    : ((quant_type_ == "nvfp4" || int4_sm80_prepacked)
                                           ? onnxruntime::contrib::qmoe_shared::MakeNvfp4ExpertBlockLayout(hid, inter, &host_layout)
